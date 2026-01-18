@@ -14,8 +14,6 @@ PATCH, and DELETE
   does not fully leverage io_uring
 - File descriptor duplication (via `libc::dup()`) bridges tokio-uring's
   ownership model with rustls's synchronous I/O requirement
-- True zero-copy, zero-syscall HTTPS requires kernel TLS (kTLS) and a
-  different architecture
 
 ## Known Behaviors
 
