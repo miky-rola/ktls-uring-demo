@@ -165,3 +165,80 @@ tokio-uring's read/write methods take ownership of buffers (completion-based I/O
 4. **src/main.rs** - Integrate kTLS with fallback
 5. **README.md** - Update architecture notes
 6. **Test** - Run against httpbin.org
+
+## Implementation Lessons Learned
+
+### 1. Secret Extraction Must Be Enabled
+
+rustls has `enable_secret_extraction = false` by default. Must set:
+```rust
+config.enable_secret_extraction = true;
+```
+Otherwise `dangerous_extract_secrets()` returns `General("Secret extraction is disabled")`.
+
+### 2. IV Decomposition for TLS 1.2 AES-GCM
+
+**Initial assumption (wrong):**
+- Split rustls 12-byte IV into: salt[0..4] + explicit_iv[4..12]
+
+**Correct approach:**
+- salt = iv[0..4] (implicit nonce, fixed per connection)
+- iv = sequence_number (explicit nonce, transmitted with each record)
+
+The 8-byte explicit nonce in kTLS should be set to the sequence number, not the
+last 8 bytes of rustls's IV.
+
+### 3. Fallback Requires New Connection
+
+When kTLS handshake fails, we can't reuse the same TCP connection for userspace
+TLS fallback because:
+- The socket state is corrupted by partial kTLS setup
+- Or the TLS handshake partially completed
+
+Solution: Create a new TCP connection for fallback.
+
+### 4. EIO on Connection Close Without close_notify
+
+When servers close TCP without sending TLS close_notify:
+- Userspace rustls: Returns `UnexpectedEof` (handled gracefully)
+- kTLS: Returns `EIO` (error code 5)
+
+Solution: Treat EIO as EOF if we already received data:
+```rust
+if e.raw_os_error() == Some(5) && !response.is_empty() {
+    break; // Treat as EOF
+}
+```
+
+### 5. Borrow Checker vs Unbuffered API
+
+The rustls unbuffered API's `process_tls_records()` borrows the input buffer,
+and the returned `state` holds references into it. This causes borrow checker
+issues when trying to discard processed bytes.
+
+Solution: Use an action enum to defer buffer manipulation until after the
+state is dropped:
+```rust
+enum HandshakeAction { NeedData }
+
+let action = match state? { ... };
+
+// Discard after state is dropped
+if discard > 0 { ... }
+
+// Handle deferred action
+if let Some(HandshakeAction::NeedData) = action { ... }
+```
+
+## Final Architecture
+
+```
+src/
+├── main.rs       # HTTP client, orchestrates kTLS + fallback
+├── handshake.rs  # Unbuffered TLS handshake, secret extraction
+└── ktls.rs       # kTLS socket configuration via setsockopt
+```
+
+All 5 HTTP methods (GET, POST, PUT, PATCH, DELETE) work with:
+- kTLS + io_uring (primary path)
+- Userspace TLS fallback (if kTLS fails)
