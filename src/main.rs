@@ -10,6 +10,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 mod handshake;
 mod ktls;
+mod websocket;
 
 struct HttpsClient {
     tls_config: Arc<ClientConfig>,
@@ -226,6 +227,126 @@ impl HttpsClient {
     }
 }
 
+struct WssClient {
+    tls_config: Arc<ClientConfig>,
+}
+
+impl WssClient {
+    fn new() -> Self {
+        let mut root_store = rustls::RootCertStore::empty();
+
+        for cert in rustls_native_certs::load_native_certs().expect("failed to load native certs") {
+            let _ = root_store.add(cert);
+        }
+
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        config.enable_secret_extraction = true;
+
+        Self {
+            tls_config: Arc::new(config),
+        }
+    }
+
+    async fn connect(
+        &self,
+        host: &str,
+        path: &str,
+    ) -> Result<TcpStream, Box<dyn std::error::Error>> {
+        let addr = format!("{host}:443")
+            .to_socket_addrs()?
+            .next()
+            .ok_or("DNS resolution failed")?;
+
+        println!("Connecting to {addr} via io_uring");
+
+        // io_uring-based async TCP connect
+        let stream = TcpStream::connect(addr).await?;
+        let fd = stream.as_raw_fd();
+
+        // TLS handshake via rustls unbuffered API
+        let server_name = ServerName::try_from(host.to_owned())?;
+
+        let result = handshake::perform_handshake(fd, self.tls_config.clone(), server_name)?;
+        let version = ktls::tls_version(result.version);
+
+        // Configure kTLS
+        ktls::configure_ktls(fd, result.tx, result.rx, version)?;
+        println!("Using kTLS (kernel TLS) + io_uring");
+
+        // Perform WebSocket handshake
+        let sec_key = websocket::generate_sec_key();
+        let handshake_request = websocket::build_handshake_request(host, path, &sec_key);
+
+        // Send WebSocket upgrade request
+        let (result, _) = stream.write_all(handshake_request.as_bytes().to_vec()).await;
+        result?;
+
+        // Read and validate upgrade response
+        let mut response = Vec::new();
+        loop {
+            let buf = vec![0u8; 4096];
+            let (result, buf) = stream.read(buf).await;
+            match result {
+                Ok(0) => return Err("Connection closed during handshake".into()),
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    // Check if we have complete HTTP response
+                    if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let response_str = String::from_utf8_lossy(&response);
+        websocket::validate_handshake_response(&response_str)?;
+        println!("WebSocket handshake complete");
+
+        Ok(stream)
+    }
+
+    async fn send_text(
+        stream: &TcpStream,
+        msg: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let frame = websocket::encode_text_frame(msg);
+        let (result, _) = stream.write_all(frame).await;
+        result?;
+        Ok(())
+    }
+
+    async fn receive(stream: &TcpStream) -> Result<websocket::Message, Box<dyn std::error::Error>> {
+        let mut buffer = Vec::new();
+
+        loop {
+            // Try to decode a frame from what we have
+            if let Some((msg, _consumed)) = websocket::decode_frame(&buffer) {
+                return Ok(msg);
+            }
+
+            // Need more data
+            let buf = vec![0u8; 4096];
+            let (result, buf) = stream.read(buf).await;
+            match result {
+                Ok(0) => return Err("Connection closed".into()),
+                Ok(n) => buffer.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    async fn close(stream: &TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+        let frame = websocket::encode_close_frame(Some(1000)); // 1000 = normal closure
+        let (result, _) = stream.write_all(frame).await;
+        result?;
+        Ok(())
+    }
+}
+
 fn split_response(resp: &str) -> (&str, &str) {
     resp.split_once("\r\n\r\n").unwrap_or((resp, ""))
 }
@@ -269,6 +390,42 @@ fn main() {
             .unwrap();
         print_response("DELETE", &r);
 
-        println!("=== done ===");
+        // WebSocket demo
+        println!("\n=== WebSocket Demo ===\n");
+
+        let ws_client = WssClient::new();
+        match ws_client.connect("ws.postman-echo.com", "/raw").await {
+            Ok(stream) => {
+                let msg = "Hello from ktls-uring-demo!";
+                println!("Sending: {msg}");
+
+                if let Err(e) = WssClient::send_text(&stream, msg).await {
+                    eprintln!("Failed to send: {e}");
+                } else {
+                    match WssClient::receive(&stream).await {
+                        Ok(websocket::Message::Text(text)) => {
+                            println!("Received: {text}");
+                        }
+                        Ok(other) => {
+                            println!("Received non-text message: {other:?}");
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to receive: {e}");
+                        }
+                    }
+                }
+
+                if let Err(e) = WssClient::close(&stream).await {
+                    eprintln!("Failed to close: {e}");
+                } else {
+                    println!("Connection closed");
+                }
+            }
+            Err(e) => {
+                eprintln!("WebSocket connection failed: {e}");
+            }
+        }
+
+        println!("\n=== done ===");
     });
 }

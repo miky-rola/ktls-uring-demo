@@ -386,3 +386,77 @@ Connection closed
 2. **Server ping/pong**: Should respond to pings with pongs
 3. **Close handshake**: Proper close requires sending close frame and waiting for response
 4. **Variable-length encoding**: Must handle 16-bit and 64-bit length encodings for large payloads
+
+### Implementation Results
+
+#### Completed Implementation
+
+**Files created:**
+- `src/websocket.rs` - Complete WebSocket framing module (RFC 6455)
+
+**Files modified:**
+- `Cargo.toml` - Added `base64 = "0.22"` dependency
+- `src/main.rs` - Added `WssClient` struct and WebSocket demo
+
+#### websocket.rs Features
+- **Handshake**: `build_handshake_request()`, `validate_handshake_response()`, `generate_sec_key()`
+- **Frame encoding**: `encode_text_frame()`, `encode_close_frame()`, `encode_pong_frame()`
+- **Frame decoding**: `parse_frame_header()`, `decode_frame()`
+- **Message types**: Text, Binary, Close, Ping, Pong (Opcode enum)
+- **Client masking**: All client frames properly masked with 4-byte XOR key
+- **Payload lengths**: Supports 7-bit, 16-bit, and 64-bit length encodings
+
+#### WssClient API
+```rust
+impl WssClient {
+    fn new() -> Self;
+    async fn connect(&self, host: &str, path: &str) -> Result<TcpStream, ...>;
+    async fn send_text(stream: &TcpStream, msg: &str) -> Result<(), ...>;
+    async fn receive(stream: &TcpStream) -> Result<Message, ...>;
+    async fn close(stream: &TcpStream) -> Result<(), ...>;
+}
+```
+
+#### Lessons Learned
+
+##### 1. echo.websocket.org Is Defunct
+The classic `echo.websocket.org` service has been shut down. Had to switch to `ws.postman-echo.com/raw` for testing.
+
+##### 2. Sec-WebSocket-Accept Validation
+For this demo, we skip SHA-1 validation of `Sec-WebSocket-Accept` header (would need another dependency). Instead, we just verify the header is present. Full validation formula:
+```
+base64(sha1(Sec-WebSocket-Key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+```
+
+##### 3. Masking Key Generation
+Used timestamp-based PRNG for simplicity. Production code should use `getrandom` or OS random source.
+
+##### 4. kTLS Works Transparently
+The beautiful part: once kTLS is set up, WebSocket frames go through the same `stream.write_all()` and `stream.read()` calls as HTTP. The kernel encrypts/decrypts at the socket layer - WebSocket framing is completely unaware of TLS.
+
+#### Final Test Output
+```
+=== WebSocket Demo ===
+
+Connecting to 3.212.69.204:443 via io_uring
+Using kTLS (kernel TLS) + io_uring
+WebSocket handshake complete
+Sending: Hello from ktls-uring-demo!
+Received: Hello from ktls-uring-demo!
+Connection closed
+```
+
+#### Architecture Summary
+```
+src/
+├── main.rs       # HTTP client + WebSocket client
+├── handshake.rs  # Unbuffered TLS handshake, secret extraction
+├── ktls.rs       # kTLS socket configuration via setsockopt
+└── websocket.rs  # WebSocket framing (RFC 6455)
+```
+
+Both HTTP and WebSocket clients share the same kTLS + io_uring infrastructure:
+- TCP connection via io_uring
+- TLS handshake via rustls unbuffered API
+- kTLS kernel encryption via setsockopt
+- Application protocol (HTTP or WebSocket) over encrypted io_uring I/O
