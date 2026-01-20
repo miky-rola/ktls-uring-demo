@@ -242,3 +242,147 @@ src/
 All 5 HTTP methods (GET, POST, PUT, PATCH, DELETE) work with:
 - kTLS + io_uring (primary path)
 - Userspace TLS fallback (if kTLS fails)
+
+---
+
+## WebSocket Client Addition
+
+### Goal
+Add a WebSocket Secure (WSS) client that runs on top of the existing kTLS + io_uring infrastructure.
+
+### Architecture Decision
+
+**Why manual WebSocket implementation?**
+
+Unlike the initial plan to use `tungstenite` library, which expects a `Read + Write` stream (blocking I/O), we need to implement WebSocket manually because:
+
+1. kTLS + io_uring uses async completion-based I/O (`stream.write_all()`, `stream.read()`)
+2. tungstenite's `client()` function requires synchronous `Read + Write` traits
+3. Manual implementation lets us use io_uring directly for all WebSocket I/O
+4. Maintains architectural consistency with the HTTP client
+
+**Data Flow:**
+```
+tokio-uring TcpStream (async TCP via io_uring)
+        ↓
+rustls unbuffered API (TLS handshake in userspace)
+        ↓
+kTLS (kernel handles encryption via setsockopt)
+        ↓
+WebSocket protocol (manual implementation)
+        ↓
+io_uring read/write (kernel encrypts/decrypts transparently)
+```
+
+### WebSocket Protocol Essentials (RFC 6455)
+
+#### 1. Opening Handshake
+Standard HTTP Upgrade request over the encrypted channel:
+```
+GET /path HTTP/1.1
+Host: echo.websocket.org
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==  (base64 of 16 random bytes)
+Sec-WebSocket-Version: 13
+```
+
+Server responds with 101 Switching Protocols and `Sec-WebSocket-Accept` header (SHA-1 hash of key + magic GUID).
+
+#### 2. Frame Format
+```
+ 0                   1
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7
++-+-+-+-+-------+-+-------------+
+|F|R|R|R| opcode|M| Payload len |
+|I|S|S|S|  (4)  |A|     (7)     |
+|N|V|V|V|       |S|             |
+| |1|2|3|       |K|             |
++-+-+-+-+-------+-+-------------+
+```
+
+- **FIN bit**: 1 = final frame (no fragmentation for simple messages)
+- **Opcode**: 0x1 = text, 0x2 = binary, 0x8 = close, 0x9 = ping, 0xA = pong
+- **MASK bit**: 1 for client frames (required by spec), 0 for server frames
+- **Payload length**:
+  - 0-125: actual length
+  - 126: next 2 bytes are length (16-bit)
+  - 127: next 8 bytes are length (64-bit)
+
+#### 3. Client Masking
+Client frames MUST be masked with a 4-byte XOR key:
+```
+masked[i] = payload[i] XOR mask_key[i % 4]
+```
+
+### Implementation Plan
+
+#### Files to Create/Modify
+1. `src/websocket.rs` (new) - WebSocket framing and handshake
+2. `src/main.rs` - Add WssClient struct and demo
+
+#### websocket.rs Functions
+- `build_handshake_request(host, path, key)` - Build HTTP Upgrade request
+- `validate_handshake_response(response, key)` - Check 101 + Sec-WebSocket-Accept
+- `encode_text_frame(payload)` - Create masked text frame
+- `encode_close_frame()` - Create close frame
+- `decode_frame(data)` - Parse incoming frame
+
+#### WssClient Implementation
+```rust
+struct WssClient {
+    tls_config: Arc<ClientConfig>,
+}
+
+impl WssClient {
+    fn new() -> Self { ... }  // Same TLS config as HttpsClient
+
+    async fn connect(&self, host: &str, path: &str) -> Result<TcpStream, ...> {
+        // 1. TCP connect via io_uring
+        // 2. TLS handshake + kTLS setup (reuse from HttpsClient)
+        // 3. Send WebSocket upgrade request via io_uring
+        // 4. Read and validate upgrade response
+        // 5. Return stream ready for frame I/O
+    }
+
+    async fn send_text(stream: &TcpStream, msg: &str) -> Result<(), ...> {
+        // Encode text frame with masking
+        // stream.write_all(frame).await
+    }
+
+    async fn receive(stream: &TcpStream) -> Result<Message, ...> {
+        // stream.read(buf).await
+        // Decode frame, handle text/binary/close/ping
+    }
+
+    async fn close(stream: &TcpStream) -> Result<(), ...> {
+        // Send close frame, await close response
+    }
+}
+```
+
+### Dependencies Needed
+- `base64` crate for Sec-WebSocket-Key encoding
+- `sha1` crate for Sec-WebSocket-Accept validation (or can skip validation for demo)
+- Random bytes from `getrandom` or just use `/dev/urandom`
+
+### Testing Target
+`wss://echo.websocket.org` - Public WebSocket echo server
+
+Expected output:
+```
+=== WebSocket Demo ===
+Connecting to echo.websocket.org:443 via io_uring
+Using kTLS (kernel TLS) + io_uring
+WebSocket handshake complete
+Sending: Hello from ktls-uring-demo!
+Received: Hello from ktls-uring-demo!
+Connection closed
+```
+
+### Potential Challenges
+
+1. **Fragmented responses**: May receive partial frames, need to buffer until complete
+2. **Server ping/pong**: Should respond to pings with pongs
+3. **Close handshake**: Proper close requires sending close frame and waiting for response
+4. **Variable-length encoding**: Must handle 16-bit and 64-bit length encodings for large payloads
