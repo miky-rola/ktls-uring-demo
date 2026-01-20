@@ -406,8 +406,21 @@ fn main() {
                         Ok(websocket::Message::Text(text)) => {
                             println!("Received: {text}");
                         }
-                        Ok(other) => {
-                            println!("Received non-text message: {other:?}");
+                        Ok(websocket::Message::Binary(data)) => {
+                            println!("Received binary: {} bytes", data.len());
+                        }
+                        Ok(websocket::Message::Close(info)) => {
+                            if let Some((code, reason)) = info {
+                                println!("Received close: {code} {reason}");
+                            } else {
+                                println!("Received close");
+                            }
+                        }
+                        Ok(websocket::Message::Ping(data)) => {
+                            println!("Received ping: {} bytes", data.len());
+                        }
+                        Ok(websocket::Message::Pong(data)) => {
+                            println!("Received pong: {} bytes", data.len());
                         }
                         Err(e) => {
                             eprintln!("Failed to receive: {e}");

@@ -3,8 +3,6 @@
 //! Minimal WebSocket protocol implementation for use with kTLS + io_uring.
 //! Handles handshake, frame encoding/decoding, and message types.
 
-#![allow(dead_code)]
-
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 /// WebSocket opcodes
@@ -45,7 +43,6 @@ pub enum Message {
 /// WebSocket frame header info
 #[derive(Debug)]
 pub struct FrameHeader {
-    pub fin: bool,
     pub opcode: Opcode,
     pub payload_len: usize,
     pub header_len: usize,
@@ -65,22 +62,6 @@ pub fn generate_sec_key() -> String {
     }
 
     BASE64.encode(key)
-}
-
-/// Compute expected Sec-WebSocket-Accept value from key
-pub fn compute_accept_key(sec_key: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Real implementation would use SHA-1, but for demo we'll validate response has the header
-    let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let combined = format!("{}{}", sec_key, magic);
-
-    let mut hasher = DefaultHasher::new();
-    combined.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    BASE64.encode(hash.to_be_bytes())
 }
 
 /// Build WebSocket handshake request
@@ -149,11 +130,6 @@ pub fn encode_close_frame(code: Option<u16>) -> Vec<u8> {
     encode_frame(Opcode::Close, &payload, true)
 }
 
-/// Encode a WebSocket pong frame (response to ping)
-pub fn encode_pong_frame(data: &[u8]) -> Vec<u8> {
-    encode_frame(Opcode::Pong, data, true)
-}
-
 /// Encode a WebSocket frame
 fn encode_frame(opcode: Opcode, payload: &[u8], masked: bool) -> Vec<u8> {
     let payload_len = payload.len();
@@ -208,7 +184,6 @@ pub fn parse_frame_header(data: &[u8]) -> Option<FrameHeader> {
         return None;
     }
 
-    let fin = (data[0] & 0x80) != 0;
     let opcode = Opcode::from_u8(data[0] & 0x0F)?;
     let masked = (data[1] & 0x80) != 0;
     let length_byte = data[1] & 0x7F;
@@ -236,7 +211,6 @@ pub fn parse_frame_header(data: &[u8]) -> Option<FrameHeader> {
     let header_len = if masked { header_len + 4 } else { header_len };
 
     Some(FrameHeader {
-        fin,
         opcode,
         payload_len,
         header_len,

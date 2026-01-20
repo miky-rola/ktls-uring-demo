@@ -460,3 +460,51 @@ Both HTTP and WebSocket clients share the same kTLS + io_uring infrastructure:
 - TLS handshake via rustls unbuffered API
 - kTLS kernel encryption via setsockopt
 - Application protocol (HTTP or WebSocket) over encrypted io_uring I/O
+
+---
+
+## Code Cleanup: Dead Code Removal
+
+### Goal
+Remove `#![allow(dead_code)]` from `websocket.rs` and fix all resulting warnings.
+
+### Warnings Identified
+After removing the allow attribute, `cargo check` showed:
+1. `Message::Binary`, `Message::Close`, `Message::Ping`, `Message::Pong` - fields never read
+2. `FrameHeader::fin` - field never read
+3. `compute_accept_key()` - function never used
+4. `encode_pong_frame()` - function never used
+
+### Analysis
+
+**Unused functions:**
+- `compute_accept_key()` was intended for full RFC compliance (validating `Sec-WebSocket-Accept` header) but we chose to skip SHA-1 validation for the demo
+- `encode_pong_frame()` was for responding to server pings, but the demo doesn't implement a full ping/pong handler
+
+**Unused `fin` field:**
+- Needed for fragmented message handling (when `fin=0`, message continues in next frame)
+- Demo assumes single-frame messages, so never checked
+
+**Message variant fields:**
+- All variants were constructed in `decode_frame()` but only `Message::Text` was destructured in `main.rs`
+- Other variants fell through to a catch-all `Ok(other) => println!("{other:?}")` which used Debug trait but didn't read the inner fields
+
+### Changes Made
+
+1. **Removed `compute_accept_key()`** - Unused, would need SHA-1 dependency for real implementation
+
+2. **Removed `encode_pong_frame()`** - Demo doesn't handle ping/pong protocol
+
+3. **Removed `fin` field from `FrameHeader`** - Demo assumes unfragmented messages
+
+4. **Updated `main.rs` to handle all Message variants explicitly:**
+   ```rust
+   Ok(websocket::Message::Text(text)) => { println!("Received: {text}"); }
+   Ok(websocket::Message::Binary(data)) => { println!("Received binary: {} bytes", data.len()); }
+   Ok(websocket::Message::Close(info)) => { ... }
+   Ok(websocket::Message::Ping(data)) => { println!("Received ping: {} bytes", data.len()); }
+   Ok(websocket::Message::Pong(data)) => { println!("Received pong: {} bytes", data.len()); }
+   ```
+
+### Result
+`cargo check` completes with no warnings. Code is cleaner and explicitly handles all WebSocket message types.
